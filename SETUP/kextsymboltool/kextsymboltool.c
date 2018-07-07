@@ -474,6 +474,7 @@ lookup_arch(const char *archstring)
 	static const NXArchInfo archlist[] = {
 		{ "x86_64", 0x01000007 /* CPU_TYPE_X86_64 */, 3 /* CPU_SUBTYPE_X86_64_ALL */, NX_LittleEndian, NULL },
 		{ "x86_64h", 0x01000007 /* CPU_TYPE_X86_64 */, 8 /* CPU_SUBTYPE_X86_64_H */, NX_LittleEndian, NULL },
+		{ "arm64", 0x0100000c /* CPU_TYPE_ARM64 */, 0 /* CPU_SUBTYPE_ARM64_ALL */, NX_LittleEndian, NULL },
 	};
 	unsigned long i;
 

@@ -8,6 +8,7 @@ include $(MakeInc_def)
 
 DATAFILES = \
 	AIC.h \
+	AMCC.h \
 	arm64_common.h \
 	board_config.h \
 	boot.h \
