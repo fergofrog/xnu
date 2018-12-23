@@ -177,22 +177,23 @@ typedef struct cpu_data
 	};
 	volatile task_map_t	cpu_task_map;
 	volatile addr64_t	cpu_task_cr3;
-	volatile addr64_t	cpu_ucr3;
 	addr64_t		cpu_kernel_cr3;
+	volatile addr64_t       cpu_ucr3;
 	boolean_t		cpu_pagezero_mapped;
 	cpu_uber_t		cpu_uber;
-	/* Double-mapped per-CPU exception stack address */
+/* Double-mapped per-CPU exception stack address */
 	uintptr_t		cd_estack;
-	/* Address of shadowed, partially mirrored CPU data structures located
-	 * in the double mapped PML4
-	 */
+	int			cpu_xstate;
+/* Address of shadowed, partially mirrored CPU data structures located
+ * in the double mapped PML4
+ */
 	void			*cd_shadow;
 	struct processor	*cpu_processor;
 #if NCOPY_WINDOWS > 0
 	struct cpu_pmap		*cpu_pmap;
 #endif
-	struct cpu_desc_table	*cpu_desc_tablep;
 	struct real_descriptor	*cpu_ldtp;
+	struct cpu_desc_table	*cpu_desc_tablep;
 	cpu_desc_index_t	cpu_desc_index;
 	int			cpu_ldt;
 #if NCOPY_WINDOWS > 0
@@ -267,7 +268,6 @@ typedef struct cpu_data
 #if CONFIG_MCA
 	struct mca_state	*cpu_mca_state;		/* State at MC fault */
 #endif
-	struct prngContext	*cpu_prng;		/* PRNG's context */
  	int			cpu_type;
  	int			cpu_subtype;
  	int			cpu_threadtype;
@@ -279,7 +279,6 @@ typedef struct cpu_data
 	int			cpu_plri;
 	plrecord_t		plrecords[MAX_PREEMPTION_RECORDS];
 #endif
-	void			*cpu_chud;
 	void			*cpu_console_buf;
 	struct x86_lcpu		lcpu;
 	int			cpu_phys_number;	/* Physical CPU */
@@ -289,6 +288,7 @@ typedef struct cpu_data
 	uint64_t		cpu_exit_cr3;
 	uint64_t		cpu_pcid_last_cr3;
 #endif
+	boolean_t		cpu_rendezvous_in_progress;
 } cpu_data_t;
 
 extern cpu_data_t	*cpu_data_ptr[];  
@@ -365,12 +365,37 @@ extern cpu_data_t	*cpu_data_ptr[];
  * inline versions of these routines.  Everyone outside, must call
  * the real thing,
  */
+
+
+/*
+ * The "volatile" flavor of current_thread() is intended for use by
+ * scheduler code which may need to update the thread pointer in the
+ * course of a context switch.  Any call to current_thread() made
+ * prior to the thread pointer update should be safe to optimize away
+ * as it should be consistent with that thread's state to the extent
+ * the compiler can reason about it.  Likewise, the context switch
+ * path will eventually result in an arbitrary branch to the new
+ * thread's pc, about which the compiler won't be able to reason.
+ * Thus any compile-time optimization of current_thread() calls made
+ * within the new thread should be safely encapsulated in its
+ * register/stack state.  The volatile form therefore exists to cover
+ * the window between the thread pointer update and the branch to
+ * the new pc.
+ */
 static inline thread_t
+get_active_thread_volatile(void)
+{
+	CPU_DATA_GET(cpu_active_thread,thread_t)
+}
+
+static inline __pure2 thread_t
 get_active_thread(void)
 {
 	CPU_DATA_GET(cpu_active_thread,thread_t)
 }
+
 #define current_thread_fast()		get_active_thread()
+#define current_thread_volatile()	get_active_thread_volatile()
 #define current_thread()		current_thread_fast()
 
 #define cpu_mode_is64bit()		TRUE
@@ -609,6 +634,11 @@ _mp_enable_preemption_no_check(void) {
 static inline cpu_data_t *
 cpu_datap(int cpu) {
 	return cpu_data_ptr[cpu];
+}
+
+static inline int
+cpu_is_running(int cpu) {
+	return ((cpu_datap(cpu) != NULL) && (cpu_datap(cpu)->cpu_running));
 }
 
 #ifdef MACH_KERNEL_PRIVATE

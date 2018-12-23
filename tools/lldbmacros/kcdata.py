@@ -30,9 +30,9 @@ kcdata_type_def = {
     'KCDATA_TYPE_INT64_DESC':           0x5,
     'KCDATA_TYPE_BINDATA_DESC':         0x6,
     'KCDATA_TYPE_ARRAY':                0x11,
-    'KCDATA_TYPE_TYPEDEFINTION':        0x12,
+    'KCDATA_TYPE_TYPEDEFINITION':       0x12,
     'KCDATA_TYPE_CONTAINER_BEGIN':      0x13,
-    'KCDATA_TYPE_CONTIANER_END':        0x14,
+    'KCDATA_TYPE_CONTAINER_END':        0x14,
 
     'KCDATA_TYPE_ARRAY_PAD0':           0x20,
     'KCDATA_TYPE_ARRAY_PAD1':           0x21,
@@ -74,9 +74,6 @@ kcdata_type_def = {
     'STACKSHOT_KCTYPE_KERN_PAGE_SIZE':  0x910,
     'STACKSHOT_KCTYPE_JETSAM_LEVEL':    0x911,
     'STACKSHOT_KCTYPE_DELTA_SINCE_TIMESTAMP': 0x912,
-    'STACKSHOT_KCTYPE_TASK_DELTA_SNAPSHOT': 0x940,
-    'STACKSHOT_KCTYPE_THREAD_DELTA_SNAPSHOT': 0x941,
-
     'STACKSHOT_KCTYPE_KERN_STACKLR':  0x913,
     'STACKSHOT_KCTYPE_KERN_STACKLR64':  0x914,
     'STACKSHOT_KCTYPE_USER_STACKLR':  0x915,
@@ -92,9 +89,16 @@ kcdata_type_def = {
     'STACKSHOT_KCTYPE_THREAD_GROUP' : 0x91f,
     'STACKSHOT_KCTYPE_JETSAM_COALITION_SNAPSHOT' : 0x920,
     'STACKSHOT_KCTYPE_JETSAM_COALITION' : 0x921,
-    'STACKSHOT_KCTYPE_INSTRS_CYCLES' : 0x923,
-
     'STACKSHOT_KCTYPE_THREAD_POLICY_VERSION': 0x922,
+    'STACKSHOT_KCTYPE_INSTRS_CYCLES' : 0x923,
+    'STACKSHOT_KCTYPE_USER_STACKTOP' : 0x924,
+    'STACKSHOT_KCTYPE_ASID' : 0x925,
+    'STACKSHOT_KCTYPE_PAGE_TABLES' : 0x926,
+    'STACKSHOT_KCTYPE_SYS_SHAREDCACHE_LAYOUT' : 0x927,
+
+    'STACKSHOT_KCTYPE_TASK_DELTA_SNAPSHOT': 0x940,
+    'STACKSHOT_KCTYPE_THREAD_DELTA_SNAPSHOT': 0x941,
+
 
 
     'KCDATA_TYPE_BUFFER_END':      0xF19158ED,
@@ -200,12 +204,14 @@ class KCSubTypeElement(object):
         return KCSubTypeElement(st_name, st_type, st_size, st_offset, st_flag)
 
     @staticmethod
-    def FromBasicCtype(st_name, st_type, st_offset=0):
+    def FromBasicCtype(st_name, st_type, st_offset=0, legacy_size=None):
         if st_type <= 0 or st_type > KCSUBTYPE_TYPE.KC_ST_UINT64:
             raise ValueError("Invalid type passed %d" % st_type)
         st_size = struct.calcsize(KCSubTypeElement._unpack_formats[st_type])
         st_flag = 0
         retval = KCSubTypeElement(st_name, st_type, st_size, st_offset, st_flag, KCSubTypeElement._get_naked_element_value)
+        if legacy_size:
+            retval.legacy_size = legacy_size
         return retval
 
     @staticmethod
@@ -289,14 +295,16 @@ class KCSubTypeElement(object):
 
 
 class KCTypeDescription(object):
-    def __init__(self, t_type_id, t_elements=[], t_name='anon', custom_repr=None, legacy_size=None, merge=False):
+    def __init__(self, t_type_id, t_elements=[], t_name='anon', custom_repr=None, legacy_size=None, merge=False, naked=False):
         self.type_id = t_type_id
         self.elements = t_elements
         self.name = t_name
         self.totalsize = 0
         self.custom_JsonRepr = custom_repr
-        self.legacy_size = legacy_size
+        if legacy_size:
+            self.legacy_size = legacy_size
         self.merge = merge
+        self.naked = naked
         for e in self.elements:
             self.totalsize += e.GetTotalSize()
 
@@ -317,7 +325,8 @@ class KCTypeDescription(object):
 
     @staticmethod
     def FromKCTypeDescription(other, t_type_id, t_name):
-        retval = KCTypeDescription(t_type_id, other.elements, t_name, other.custom_JsonRepr)
+        retval = KCTypeDescription(t_type_id, other.elements, t_name, other.custom_JsonRepr,
+                                   legacy_size=getattr(other, 'legacy_size', None))
         return retval
 
     def ShouldMerge(self):
@@ -328,11 +337,14 @@ class KCTypeDescription(object):
             padding = (flags & KCDATA_FLAGS_STRUCT_PADDING_MASK)
             if padding:
                 base_data = base_data[:-padding]
-        elif self.legacy_size and len(base_data) == self.legacy_size + ((-self.legacy_size) & 0xf):
+        elif hasattr(self, 'legacy_size') and len(base_data) == self.legacy_size + ((-self.legacy_size) & 0xf):
             base_data = base_data[:self.legacy_size]
         if self.custom_JsonRepr:
             return self.custom_JsonRepr([e.GetValue(base_data) for e in self.elements])
-        o = ", ".join(['"%s": %s' % (e.GetName(), e.GetJsonRepr(base_data)) for e in self.elements if not e.ShouldSkip(base_data)])
+        if self.naked:
+            o = ", ".join([e.GetJsonRepr(base_data) for e in self.elements if not e.ShouldSkip(base_data)])
+        else:
+            o = ", ".join(['"%s": %s' % (e.GetName(), e.GetJsonRepr(base_data)) for e in self.elements if not e.ShouldSkip(base_data)])
         if not self.merge:
             o = '{' + o + '}'
         return o
@@ -423,7 +435,7 @@ class KCObject(object):
         return KCObject(kcitem.i_type, kcitem.i_data, kcitem.i_offset, kcitem.i_flags)
 
     def IsContainerEnd(self):
-        return self.i_type == GetTypeForName('KCDATA_TYPE_CONTIANER_END')
+        return self.i_type == GetTypeForName('KCDATA_TYPE_CONTAINER_END')
 
     def IsBufferEnd(self):
         return self.i_type == GetTypeForName('KCDATA_TYPE_BUFFER_END')
@@ -465,7 +477,7 @@ class KCObject(object):
             self.obj['typeID'] = self.i_type
             logging.info("0x%08x: %s%s" % (self.offset, INDENT(), self.i_name))
 
-        elif self.i_type == GetTypeForName('KCDATA_TYPE_CONTIANER_END'):
+        elif self.i_type == GetTypeForName('KCDATA_TYPE_CONTAINER_END'):
             self.obj['uniqID'] = self.i_flags
             logging.info("0x%08x: %sEND" % (self.offset, INDENT(end=True)))
 
@@ -487,7 +499,7 @@ class KCObject(object):
             self.obj = u_d[1]
             logging.info("0x%08x: %s%s" % (self.offset, INDENT(), self.i_name))
 
-        elif self.i_type == GetTypeForName('KCDATA_TYPE_TYPEDEFINTION'):
+        elif self.i_type == GetTypeForName('KCDATA_TYPE_TYPEDEFINITION'):
             self.is_naked_type = True
             u_d = struct.unpack_from('II32s', self.i_data)
             self.obj['name'] = u_d[2].split(chr(0))[0]
@@ -497,10 +509,8 @@ class KCObject(object):
             element_arr = []
             for i in range(u_d[1]):
                 e = KCSubTypeElement.FromBinaryTypeData(self.i_data[40+(i*40):])
-                #print str(e)
                 element_arr.append(e)
             type_desc = KCTypeDescription(u_d[0], element_arr, self.obj['name'])
-            #print str(type_desc)
             self.obj['fields'] = [str(e) for e in element_arr]
             KNOWN_TYPES_COLLECTION[type_desc.GetTypeID()] = type_desc
             logging.info("0x%08x: %s%s" % (self.offset, INDENT(), self.i_name))
@@ -511,9 +521,9 @@ class KCObject(object):
             if e_t not in LEGAL_OLD_STYLE_ARRAY_TYPES:
                 raise Exception, "illegal old-style array type: %s (0x%x)" % (GetTypeNameForKey(e_t), e_t)
             e_c = self.i_flags & 0xffffffff
-            e_s = KNOWN_TYPES_COLLECTION[e_t].sizeof()
+            e_s = KNOWN_TYPES_COLLECTION[e_t].legacy_size
             if e_s * e_c > self.i_size:
-                raise Excpetion, "array too small for its count"
+                raise Exception("array too small for its count")
             self.obj['typeID'] = e_t
             self.i_name = GetTypeNameForKey(e_t)
             self.i_type = e_t
@@ -824,8 +834,11 @@ KNOWN_TYPES_COLLECTION[GetTypeForName('STACKSHOT_KCTYPE_THREAD_DELTA_SNAPSHOT')]
     KCSubTypeElement.FromBasicCtype('tds_rqos', KCSUBTYPE_TYPE.KC_ST_UINT8, 45),
     KCSubTypeElement.FromBasicCtype('tds_rqos_override', KCSUBTYPE_TYPE.KC_ST_UINT8, 46),
     KCSubTypeElement.FromBasicCtype('tds_io_tier', KCSUBTYPE_TYPE.KC_ST_UINT8, 47),
+    KCSubTypeElement.FromBasicCtype('tds_requested_policy', KCSUBTYPE_TYPE.KC_ST_UINT64, 48),
+    KCSubTypeElement.FromBasicCtype('tds_effective_policy', KCSUBTYPE_TYPE.KC_ST_UINT64, 56),
 ),
-    'thread_delta_snapshot'
+    'thread_delta_snapshot',
+    legacy_size = 48
 )
 
 KNOWN_TYPES_COLLECTION[GetTypeForName('STACKSHOT_KCTYPE_TASK_DELTA_SNAPSHOT')] = KCTypeDescription(GetTypeForName('STACKSHOT_KCTYPE_TASK_DELTA_SNAPSHOT'), (
@@ -849,20 +862,27 @@ KNOWN_TYPES_COLLECTION[GetTypeForName('STACKSHOT_KCTYPE_TASK_DELTA_SNAPSHOT')] =
 
 KNOWN_TYPES_COLLECTION[0x909] = KCSubTypeElement('pth_name', KCSUBTYPE_TYPE.KC_ST_CHAR, KCSubTypeElement.GetSizeForArray(64, 1), 0, 1)
 
-
+KNOWN_TYPES_COLLECTION[GetTypeForName('STACKSHOT_KCTYPE_SYS_SHAREDCACHE_LAYOUT')] = KCTypeDescription(GetTypeForName('STACKSHOT_KCTYPE_SYS_SHAREDCACHE_LAYOUT'), (
+    KCSubTypeElement('imageLoadAddress', KCSUBTYPE_TYPE.KC_ST_UINT64, 8, 0, 0),
+    KCSubTypeElement('imageUUID', KCSUBTYPE_TYPE.KC_ST_UINT8, KCSubTypeElement.GetSizeForArray(16, 1), 8, 1)
+),
+    'system_shared_cache_layout'
+)
 
 KNOWN_TYPES_COLLECTION[GetTypeForName('KCDATA_TYPE_LIBRARY_LOADINFO64')] = KCTypeDescription(GetTypeForName('KCDATA_TYPE_LIBRARY_LOADINFO64'), (
     KCSubTypeElement('imageLoadAddress', KCSUBTYPE_TYPE.KC_ST_UINT64, 8, 0, 0),
     KCSubTypeElement('imageUUID', KCSUBTYPE_TYPE.KC_ST_UINT8, KCSubTypeElement.GetSizeForArray(16, 1), 8, 1)
 ),
-    'dyld_load_info'
+    'dyld_load_info',
+    legacy_size = 24
 )
 
 KNOWN_TYPES_COLLECTION[GetTypeForName('KCDATA_TYPE_LIBRARY_LOADINFO')] = KCTypeDescription(GetTypeForName('KCDATA_TYPE_LIBRARY_LOADINFO'), (
     KCSubTypeElement('imageLoadAddress', KCSUBTYPE_TYPE.KC_ST_UINT32, 4, 0, 0),
     KCSubTypeElement('imageUUID', KCSUBTYPE_TYPE.KC_ST_UINT8, KCSubTypeElement.GetSizeForArray(16, 1), 4, 1)
 ),
-    'dyld_load_info'
+    'dyld_load_info',
+    legacy_size = 20
 )
 
 KNOWN_TYPES_COLLECTION[GetTypeForName('STACKSHOT_KCTYPE_SHAREDCACHE_LOADINFO')] = KCTypeDescription(GetTypeForName('STACKSHOT_KCTYPE_SHAREDCACHE_LOADINFO'), (
@@ -882,7 +902,7 @@ KNOWN_TYPES_COLLECTION[GetTypeForName('STACKSHOT_KCTYPE_KERNELCACHE_LOADINFO')] 
 )
 
 KNOWN_TYPES_COLLECTION[0x33] = KCSubTypeElement('mach_absolute_time', KCSUBTYPE_TYPE.KC_ST_UINT64, 8, 0, 0, KCSubTypeElement._get_naked_element_value)
-KNOWN_TYPES_COLLECTION[0x907] = KCSubTypeElement.FromBasicCtype('donating_pids', KCSUBTYPE_TYPE.KC_ST_INT32)
+KNOWN_TYPES_COLLECTION[0x907] = KCSubTypeElement.FromBasicCtype('donating_pids', KCSUBTYPE_TYPE.KC_ST_INT32, legacy_size=4)
 
 KNOWN_TYPES_COLLECTION[GetTypeForName('KCDATA_TYPE_USECS_SINCE_EPOCH')] = KCSubTypeElement('usecs_since_epoch', KCSUBTYPE_TYPE.KC_ST_UINT64, 8, 0, 0, KCSubTypeElement._get_naked_element_value)
 
@@ -890,7 +910,8 @@ KNOWN_TYPES_COLLECTION[GetTypeForName('STACKSHOT_KCTYPE_KERN_STACKFRAME')] = KCT
     KCSubTypeElement.FromBasicCtype('lr', KCSUBTYPE_TYPE.KC_ST_UINT32),
     KCSubTypeElement.FromBasicCtype('sp', KCSUBTYPE_TYPE.KC_ST_UINT32, 4)
 ),
-    'kernel_stack_frames'
+    'kernel_stack_frames',
+    legacy_size = 8
 )
 
 KNOWN_TYPES_COLLECTION[GetTypeForName('STACKSHOT_KCTYPE_KERN_STACKLR')] = KCTypeDescription(GetTypeForName('STACKSHOT_KCTYPE_KERN_STACKLR'), (
@@ -916,7 +937,8 @@ KNOWN_TYPES_COLLECTION[GetTypeForName('STACKSHOT_KCTYPE_KERN_STACKFRAME64')] = K
     KCSubTypeElement.FromBasicCtype('lr', KCSUBTYPE_TYPE.KC_ST_UINT64),
     KCSubTypeElement.FromBasicCtype('sp', KCSUBTYPE_TYPE.KC_ST_UINT64, 8)
 ),
-    'kernel_stack_frames'
+    'kernel_stack_frames',
+    legacy_size = 16
 )
 
 KNOWN_TYPES_COLLECTION[GetTypeForName('STACKSHOT_KCTYPE_USER_STACKFRAME64')] = KCTypeDescription.FromKCTypeDescription(
@@ -1005,6 +1027,18 @@ KNOWN_TYPES_COLLECTION[GetTypeForName('STACKSHOT_KCTYPE_INSTRS_CYCLES')] = KCTyp
             ),
             'instrs_cycles_snapshot')
 
+def set_type(name, *args):
+    typ = GetTypeForName(name)
+    KNOWN_TYPES_COLLECTION[typ] = KCTypeDescription(GetTypeForName(typ), *args)
+
+
+set_type('STACKSHOT_KCTYPE_USER_STACKTOP',
+         (
+             KCSubTypeElement.FromBasicCtype('sp', KCSUBTYPE_TYPE.KC_ST_UINT64, 0),
+             KCSubTypeElement('stack_contents', KCSUBTYPE_TYPE.KC_ST_UINT8, KCSubTypeElement.GetSizeForArray(8, 1), 8, 1),
+         ),
+         'user_stacktop')
+
 #KNOWN_TYPES_COLLECTION[0x907] = KCSubTypeElement('donating_pids', KCSUBTYPE_TYPE.KC_ST_UINT32, 4, 0, 0, KCSubTypeElement._get_naked_element_value)
 KNOWN_TYPES_COLLECTION[GetTypeForName('TASK_CRASHINFO_PID')] = KCSubTypeElement('pid', KCSUBTYPE_TYPE.KC_ST_INT32, 4, 0, 0)
 KNOWN_TYPES_COLLECTION[GetTypeForName('TASK_CRASHINFO_PPID')] = KCSubTypeElement('ppid', KCSUBTYPE_TYPE.KC_ST_INT32, 4, 0, 0)
@@ -1086,6 +1120,7 @@ KNOWN_TYPES_COLLECTION[GetTypeForName('STACKSHOT_KCTYPE_CPU_TIMES')] = KCTypeDes
     (
         KCSubTypeElement.FromBasicCtype('user_usec', KCSUBTYPE_TYPE.KC_ST_UINT64, 0),
         KCSubTypeElement.FromBasicCtype('system_usec', KCSUBTYPE_TYPE.KC_ST_UINT64, 8),
+        KCSubTypeElement.FromBasicCtype('runnable_usec', KCSUBTYPE_TYPE.KC_ST_UINT64, 16),
     ), 'cpu_times')
 
 KNOWN_TYPES_COLLECTION[GetTypeForName('STACKSHOT_KCTYPE_STACKSHOT_DURATION')] = KCTypeDescription(GetTypeForName('STACKSHOT_KCTYPE_STACKSHOT_DURATION'),
@@ -1141,6 +1176,16 @@ KNOWN_TYPES_COLLECTION[GetTypeForName('EXIT_REASON_WORKLOOP_ID')] = (
 KNOWN_TYPES_COLLECTION[GetTypeForName('EXIT_REASON_DISPATCH_QUEUE_NO')] = (
         KCSubTypeElement('exit_reason_dispatch_queue_no', KCSUBTYPE_TYPE.KC_ST_UINT64, 8, 0, 0, KCSubTypeElement._get_naked_element_value))
 
+KNOWN_TYPES_COLLECTION[GetTypeForName('STACKSHOT_KCTYPE_ASID')] = (
+    KCSubTypeElement('ts_asid', KCSUBTYPE_TYPE.KC_ST_UINT32, 4, 0, 0))
+
+KNOWN_TYPES_COLLECTION[GetTypeForName('STACKSHOT_KCTYPE_PAGE_TABLES')] = KCTypeDescription(GetTypeForName('STACKSHOT_KCTYPE_PAGE_TABLES'), (
+    KCSubTypeElement(None, KCSUBTYPE_TYPE.KC_ST_UINT64, 8, 0, 0, KCSubTypeElement._get_naked_element_value), ),
+    'ts_pagetable',
+    merge=True,
+    naked=True
+)
+
 def GetSecondsFromMATime(mat, tb):
     return (float(mat) * tb['numer']) / tb['denom']
 
@@ -1185,6 +1230,7 @@ def GetStateDescription(s):
     TH_UNINT = 0x08
     TH_TERMINATE = 0x10
     TH_TERMINATE2 = 0x20
+    TH_WAIT_REPORT = 0x40
     TH_IDLE = 0x80
     if (s & TH_WAIT):
         retval.append("TH_WAIT")
@@ -1198,6 +1244,8 @@ def GetStateDescription(s):
         retval.append("TH_TERMINATE")
     if (s & TH_TERMINATE2):
         retval.append("TH_TERMINATE2")
+    if (s & TH_WAIT_REPORT):
+        retval.append("TH_WAIT_REPORT")
     if (s & TH_IDLE):
         retval.append("TH_IDLE")
     return retval
@@ -1223,6 +1271,7 @@ kThreadWaitPThreadRWLockWrite   = 0x0d
 kThreadWaitPThreadCondVar       = 0x0e
 kThreadWaitParkedWorkQueue      = 0x0f
 kThreadWaitWorkloopSyncWait     = 0x10
+kThreadWaitOnProcess            = 0x11
 
 
 UINT64_MAX = 0xffffffffffffffff
@@ -1281,7 +1330,7 @@ def formatWaitInfo(info):
         else:
             s += "unknown port"
     elif type == kThreadWaitSemaphore:
-        s += "semaphore port %x" % context
+        s += "semaphore port %x " % context
         if owner:
             s += "owned by pid %d" % owner
         else:
@@ -1294,13 +1343,13 @@ def formatWaitInfo(info):
         s += "krwlock %x for upgrading" % context
     elif type == kThreadWaitUserLock:
         if owner:
-            s += "unfair lock %x owned by pid %d" % (context, owner)
+            s += "unfair lock %x owned by thread %d" % (context, owner)
         else:
             s += "spin lock %x" % context
     elif type == kThreadWaitPThreadMutex:
         s += "pthread mutex %x" % context
         if owner:
-            s += " owned by pid %d" % owner
+            s += " owned by thread %d" % owner
         else:
             s += " with unknown owner"
     elif type == kThreadWaitPThreadRWLockRead:
@@ -1320,6 +1369,9 @@ def formatWaitInfo(info):
         else:
             s += ", unknown owner"
         s += ", workloop id %x" % context
+    elif type == kThreadWaitOnProcess:
+        s += "waitpid, for pid %d" % owner
+
     else:
         s += "unknown type %d (owner %d, context %x)" % (type, owner, context)
 
@@ -1358,9 +1410,9 @@ def SaveStackshotReport(j, outfile_name, dsc_uuid, dsc_libs_arr, incomplete):
         return
 
     dsc_common = [format_uuid(ss.get('shared_cache_dyld_load_info')['imageUUID']),
-                  shared_cache_base_addr,
-                  "S"
-                 ]
+                  shared_cache_base_addr, "S" ]
+
+    dsc_layout = ss.get('system_shared_cache_layout')
 
     dsc_libs = []
     print "Shared cache UUID found from the binary data is <%s> " % str(dsc_common[0])
@@ -1372,11 +1424,17 @@ def SaveStackshotReport(j, outfile_name, dsc_uuid, dsc_libs_arr, incomplete):
         for i in dsc_libs_arr:
             _uuid = i[2].lower().replace('-','').strip()
             _addr = int(i[0], 16) + _load_addr
-            dsc_libs.append([_uuid, _addr, "P"])
+            dsc_libs.append([_uuid, _addr, "C"])
             #print "adding ", [_uuid, _addr, "C"]
     elif dsc_uuid:
         print "Provided shared cache UUID does not match. Skipping writing report."
         return
+    elif dsc_layout:
+        print "Found in memory system shared cache layout with {} images".format(len(dsc_layout))
+        slide = ss.get('shared_cache_dyld_load_info')['imageLoadAddress']
+
+        for image in dsc_layout:
+            dsc_libs.append([format_uuid(image['imageUUID']), image['imageLoadAddress'] + slide, "C"])
 
     AllImageCatalog = []
     obj = {}
@@ -1443,6 +1501,15 @@ def SaveStackshotReport(j, outfile_name, dsc_uuid, dsc_libs_arr, incomplete):
             continue
         tasksnap = piddata['task_snapshot']
         tsnap["pid"] = tasksnap["ts_pid"]
+        if 'ts_asid' in piddata:
+            tsnap["asid"] = piddata["ts_asid"]
+
+        if 'ts_pagetable' in piddata:
+            pagetables = []
+            for tte in piddata["ts_pagetable"]:
+                pagetables.append(tte)
+            tsnap["pageTables"] = pagetables
+
         tsnap["residentMemoryBytes"] = tasksnap["ts_task_size"]
         tsnap["timesDidThrottle"] = tasksnap["ts_did_throttle"]
         tsnap["systemTimeTask"] = GetSecondsFromMATime(tasksnap["ts_system_time_in_terminated_th"], timebase)
@@ -1484,6 +1551,11 @@ def SaveStackshotReport(j, outfile_name, dsc_uuid, dsc_libs_arr, incomplete):
                 for f in thdata["user_stack_frames"]:
                     uframes.append(GetSymbolInfoForFrame(AllImageCatalog, pr_libs, f['lr']))
                 thsnap["userFrames"] = uframes
+
+            if "user_stacktop" in thdata:
+                (address,) = struct.unpack("<Q", struct.pack("B"*8, *thdata["user_stacktop"]["stack_contents"]))
+                thsnap["userStacktop"] = GetSymbolInfoForFrame(AllImageCatalog, pr_libs, address)
+
             if threadsnap['ths_wait_event']:
                 thsnap["waitEvent"] = GetSymbolInfoForFrame(AllImageCatalog, pr_libs, threadsnap['ths_wait_event'])
 
@@ -1645,6 +1717,14 @@ def prettify(data):
                 value = '%02X%02X%02X%02X-%02X%02X-%02X%02X-%02X%02X-%02X%02X%02X%02X%02X%02X' % tuple(value)
             elif 'address' in key.lower() and isinstance(value, (int, long)):
                 value = '0x%X' % value
+            elif key == 'lr':
+                value = '0x%X' % value
+            elif key == 'thread_waitinfo':
+                value = map(formatWaitInfo, value)
+            elif key == 'stack_contents':
+                print value
+                (address,) = struct.unpack("<Q", struct.pack("B"*8, *value))
+                value = '0x%X' % address
             else:
                 value = prettify(value);
             newdata[key] = value

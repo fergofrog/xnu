@@ -33,6 +33,7 @@
 #include <libkern/c++/OSContainers.h>
 #include <libkern/c++/OSKext.h>
 #include <libkern/c++/OSUnserialize.h>
+#include <libkern/Block.h>
 #include <IOKit/IOCatalogue.h>
 #include <IOKit/IOCommand.h>
 #include <IOKit/IODeviceTreeSupport.h>
@@ -466,6 +467,11 @@ const char *getCpuDelayBusStallHolderName(void) {
     return sCPULatencyHolderName[kCpuDelayBusStall];
 }
 
+const char *getCpuInterruptDelayHolderName(void);
+const char *getCpuInterruptDelayHolderName(void) {
+    return sCPULatencyHolderName[kCpuDelayInterrupt];
+}
+
 }
 #endif
 
@@ -608,7 +614,12 @@ void IOService::free( void )
 
     if (_numInterruptSources && _interruptSources)
     {
-	IOFree(_interruptSources, _numInterruptSources * sizeof(IOInterruptSource));
+	for (i = 0; i < _numInterruptSources; i++) {
+	    void * block = _interruptSourcesPrivate(this)[i].vectorBlock;
+	    if (block) Block_release(block);
+	}
+	IOFree(_interruptSources,
+		_numInterruptSources * sizeofAllIOInterruptSource);
 	_interruptSources = 0;
     }
 
@@ -719,7 +730,7 @@ void IOService::detach( IOService * provider )
 
     unlockForArbitration();
 
-    if( newProvider) {
+    if( newProvider && adjParent) {
         newProvider->lockForArbitration();
         newProvider->_adjustBusy(1);
         newProvider->unlockForArbitration();
@@ -1805,11 +1816,44 @@ IONotifier * IOService::registerInterest( const OSSymbol * typeOfInterest,
     return( notify );
 }
 
+
+
+static IOReturn
+IOServiceInterestHandlerToBlock( void * target __unused, void * refCon,
+                                              UInt32 messageType, IOService * provider,
+                                              void * messageArgument, vm_size_t argSize )
+{
+    return ((IOServiceInterestHandlerBlock) refCon)(messageType, provider, messageArgument, argSize);
+}
+
+IONotifier * IOService::registerInterest(const OSSymbol * typeOfInterest,
+                  IOServiceInterestHandlerBlock handler)
+{
+    IONotifier * notify;
+    void       * block;
+
+    block = Block_copy(handler);
+    if (!block) return (NULL);
+
+    notify = registerInterest(typeOfInterest, &IOServiceInterestHandlerToBlock, NULL, block);
+
+    if (!notify) Block_release(block);
+
+    return (notify);
+}
+
 IOReturn IOService::registerInterestForNotifier( IONotifier *svcNotify, const OSSymbol * typeOfInterest,
                   IOServiceInterestHandler handler, void * target, void * ref )
 {
     IOReturn rc = kIOReturnSuccess;
     _IOServiceInterestNotifier  *notify = 0;
+
+    if (!svcNotify || !(notify = OSDynamicCast(_IOServiceInterestNotifier, svcNotify)))
+        return( kIOReturnBadArgument );
+
+    notify->handler = handler;
+    notify->target = target;
+    notify->ref = ref;
 
     if( (typeOfInterest != gIOGeneralInterest)
      && (typeOfInterest != gIOBusyInterest)
@@ -1818,15 +1862,9 @@ IOReturn IOService::registerInterestForNotifier( IONotifier *svcNotify, const OS
      && (typeOfInterest != gIOPriorityPowerStateInterest))
         return( kIOReturnBadArgument );
 
-    if (!svcNotify || !(notify = OSDynamicCast(_IOServiceInterestNotifier, svcNotify)))
-        return( kIOReturnBadArgument );
-
     lockForArbitration();
     if( 0 == (__state[0] & kIOServiceInactiveState)) {
 
-        notify->handler = handler;
-        notify->target = target;
-        notify->ref = ref;
         notify->state = kIOServiceNotifyEnable;
 
         ////// queue
@@ -1937,6 +1975,9 @@ void _IOServiceInterestNotifier::wait()
 void _IOServiceInterestNotifier::free()
 {
     assert( queue_empty( &handlerInvocations ));
+
+    if (handler == &IOServiceInterestHandlerToBlock) Block_release(ref);
+
     OSObject::free();
 }
 
@@ -2278,16 +2319,20 @@ void IOService::scheduleTerminatePhase2( IOOptionBits options )
 		terminateWorker( options );
             wait = (0 != (__state[1] & kIOServiceBusyStateMask));
             if( wait) {
-                // wait for the victim to go non-busy
+                /* wait for the victim to go non-busy */
                 if( !haveDeadline) {
                     clock_interval_to_deadline( 15, kSecondScale, &deadline );
                     haveDeadline = true;
                 }
+                /* let others do work while we wait */
+                gIOTerminateThread = 0;
+                IOLockWakeup( gJobsLock, (event_t) &gIOTerminateThread, /* one-thread */ false);
                 waitResult = IOLockSleepDeadline( gJobsLock, &gIOTerminateWork,
                                                   deadline, THREAD_UNINT );
-                if(__improbable(waitResult == THREAD_TIMED_OUT)) {
+                if (__improbable(waitResult == THREAD_TIMED_OUT)) {
                     panic("%s[0x%qx]::terminate(kIOServiceSynchronous) timeout\n", getName(), getRegistryEntryID());
-		}
+                }
+                waitToBecomeTerminateThread();
             }
         } while(gIOTerminateWork || (wait && (waitResult != THREAD_TIMED_OUT)));
 
@@ -2672,15 +2717,9 @@ void IOService::terminateWorker( IOOptionBits options )
 		    notifiers = victim->copyNotifiers(gIOWillTerminateNotification, 0, 0xffffffff);
 		    victim->invokeNotifiers(&notifiers);
 
-                    if( 0 == victim->getClient()) {
-
-                        // no clients - will go to finalize
-			victim->scheduleFinalize(false);
-
-                    } else {
-                        _workLoopAction( (IOWorkLoop::Action) &actionWillTerminate,
+                    _workLoopAction( (IOWorkLoop::Action) &actionWillTerminate,
                                             victim, (void *)(uintptr_t) options, (void *)(uintptr_t) doPhase2List );
-                    }
+
                     didPhase2List->headQ( victim );
                 }
                 victim->release();
@@ -2692,9 +2731,10 @@ void IOService::terminateWorker( IOOptionBits options )
             }
         
             while( (victim = (IOService *) didPhase2List->getObject(0)) ) {
-    
-                if( victim->lockForArbitration( true )) {
+		bool scheduleFinalize = false;
+		if( victim->lockForArbitration( true )) {
                     victim->__state[1] |= kIOServiceTermPhase3State;
+                    scheduleFinalize = (0 == victim->getClient());
                     victim->unlockForArbitration();
                 }
                 _workLoopAction( (IOWorkLoop::Action) &actionDidTerminate,
@@ -2703,6 +2743,8 @@ void IOService::terminateWorker( IOOptionBits options )
 		    _workLoopAction( (IOWorkLoop::Action) &actionDidStop,
 					victim, (void *)(uintptr_t) options, NULL );
 		}
+                // no clients - will go to finalize
+                if (scheduleFinalize) victim->scheduleFinalize(false);
                 didPhase2List->removeObject(0);
             }
             IOLockLock( gJobsLock );
@@ -2713,10 +2755,17 @@ void IOService::terminateWorker( IOOptionBits options )
             doPhase3 = false;
             // finalize leaves
             while( (victim = (IOService *) gIOFinalizeList->getObject(0))) {
-    
+                bool sendFinal = false;
                 IOLockUnlock( gJobsLock );
-                _workLoopAction( (IOWorkLoop::Action) &actionFinalize,
+                if (victim->lockForArbitration(true)) {
+                    sendFinal = (0 == (victim->__state[1] & kIOServiceFinalized));
+                    if (sendFinal) victim->__state[1] |= kIOServiceFinalized;
+                    victim->unlockForArbitration();
+                }
+                if (sendFinal) {
+                    _workLoopAction( (IOWorkLoop::Action) &actionFinalize,
                                     victim, (void *)(uintptr_t) options );
+                }
                 IOLockLock( gJobsLock );
                 // hold off free
                 freeList->setObject( victim );
@@ -2745,22 +2794,26 @@ void IOService::terminateWorker( IOOptionBits options )
 
                 } else {
                     // a terminated client is not ready for stop if it has clients, skip it
-                    if( (kIOServiceInactiveState & client->__state[0]) && client->getClient()) {
-                        TLOG("%s[0x%qx]::defer stop(%s[0x%qx])\n", 
-                        	client->getName(), regID2, 
-                        	client->getClient()->getName(), client->getClient()->getRegistryEntryID());
-			IOServiceTrace(
-			    IOSERVICE_TERMINATE_STOP_DEFER,
-			    (uintptr_t) regID1, 
-			    (uintptr_t) (regID1 >> 32),
-			    (uintptr_t) regID2, 
-			    (uintptr_t) (regID2 >> 32));
-
-                        idx++;
-                        continue;
-                    }
-        
+                    bool deferStop = (0 != (kIOServiceInactiveState & client->__state[0]));
                     IOLockUnlock( gJobsLock );
+                    if (deferStop && client->lockForArbitration(true)) {
+                        deferStop = (0 == (client->__state[1] & kIOServiceFinalized));
+                        //deferStop = (!deferStop && (0 != client->getClient()));
+                        //deferStop = (0 != client->getClient());
+                        client->unlockForArbitration();
+                        if (deferStop) {
+                            TLOG("%s[0x%qx]::defer stop()\n", client->getName(), regID2);
+                            IOServiceTrace(IOSERVICE_TERMINATE_STOP_DEFER,
+                               (uintptr_t) regID1,
+                               (uintptr_t) (regID1 >> 32),
+                               (uintptr_t) regID2,
+                               (uintptr_t) (regID2 >> 32));
+
+                            idx++;
+                            IOLockLock( gJobsLock );
+                            continue;
+                        }
+                    }
                     _workLoopAction( (IOWorkLoop::Action) &actionStop,
                                      provider, (void *) client );
                     IOLockLock( gJobsLock );
@@ -4663,6 +4716,34 @@ IONotifier * IOService::addMatchingNotification(
     return( ret );
 }
 
+static bool
+IOServiceMatchingNotificationHandlerToBlock( void * target __unused, void * refCon,
+                                  IOService * newService,
+                                  IONotifier * notifier )
+{
+    return ((IOServiceMatchingNotificationHandlerBlock) refCon)(newService, notifier);
+}
+
+IONotifier * IOService::addMatchingNotification(
+                            const OSSymbol * type, OSDictionary * matching,
+                            SInt32 priority,
+                            IOServiceMatchingNotificationHandlerBlock handler)
+{
+    IONotifier * notify;
+    void       * block;
+
+    block = Block_copy(handler);
+    if (!block) return (NULL);
+
+    notify = addMatchingNotification(type, matching,
+		&IOServiceMatchingNotificationHandlerToBlock, NULL, block, priority);
+
+    if (!notify) Block_release(block);
+
+    return (notify);
+}
+
+
 bool IOService::syncNotificationHandler(
 			void * /* target */, void * ref,
 			IOService * newService,
@@ -4964,6 +5045,9 @@ void _IOServiceNotifier::wait()
 void _IOServiceNotifier::free()
 {
     assert( queue_empty( &handlerInvocations ));
+
+    if (handler == &IOServiceMatchingNotificationHandlerToBlock) Block_release(ref);
+
     OSObject::free();
 }
 
@@ -6286,10 +6370,11 @@ IOReturn IOService::resolveInterrupt(IOService *nub, int source)
   // Allocate space for the IOInterruptSources if needed... then return early.
   if (nub->_interruptSources == 0) {
     numSources = array->getCount();
-    interruptSources = (IOInterruptSource *)IOMalloc(numSources * sizeof(IOInterruptSource));
+    interruptSources = (IOInterruptSource *)IOMalloc(
+	numSources * sizeofAllIOInterruptSource);
     if (interruptSources == 0) return kIOReturnNoMemory;
     
-    bzero(interruptSources, numSources * sizeof(IOInterruptSource));
+    bzero(interruptSources, numSources * sizeofAllIOInterruptSource);
     
     nub->_numInterruptSources = numSources;
     nub->_interruptSources = interruptSources;
@@ -6336,7 +6421,7 @@ IOReturn IOService::lookupInterrupt(int source, bool resolve, IOInterruptControl
   if (*interruptController == NULL) {
     if (!resolve) return kIOReturnNoInterrupt;
     
-    /* Try to reslove the interrupt */
+    /* Try to resolve the interrupt */
     ret = resolveInterrupt(this, source);
     if (ret != kIOReturnSuccess) return ret;    
     
@@ -6362,16 +6447,49 @@ IOReturn IOService::registerInterrupt(int source, OSObject *target,
 						refCon);
 }
 
+static void IOServiceInterruptActionToBlock( OSObject * target, void * refCon,
+                   IOService * nub, int source )
+{
+  ((IOInterruptActionBlock)(refCon))(nub, source);
+}
+
+IOReturn IOService::registerInterruptBlock(int source, OSObject *target,
+				      IOInterruptActionBlock handler)
+{
+    IOReturn ret;
+    void   * block;
+
+    block = Block_copy(handler);
+    if (!block) return (kIOReturnNoMemory);
+
+    ret = registerInterrupt(source, target, &IOServiceInterruptActionToBlock, block);
+    if (kIOReturnSuccess != ret) {
+      Block_release(block);
+      return (ret);
+    }
+    _interruptSourcesPrivate(this)[source].vectorBlock = block;
+
+    return (ret);
+}
+
 IOReturn IOService::unregisterInterrupt(int source)
 {
-  IOInterruptController *interruptController;
   IOReturn              ret;
+  IOInterruptController *interruptController;
+  void                  *block;
   
   ret = lookupInterrupt(source, false, &interruptController);
   if (ret != kIOReturnSuccess) return ret;
   
   /* Unregister the source */
-  return interruptController->unregisterInterrupt(this, source);
+  block = _interruptSourcesPrivate(this)[source].vectorBlock;
+  ret = interruptController->unregisterInterrupt(this, source);
+  if ((kIOReturnSuccess == ret) && (block = _interruptSourcesPrivate(this)[source].vectorBlock)) {
+    _interruptSourcesPrivate(this)[source].vectorBlock = NULL;
+    Block_release(block);
+  }
+
+  return ret;
 }
 
 IOReturn IOService::addInterruptStatistics(IOInterruptAccountingData * statistics, int source)

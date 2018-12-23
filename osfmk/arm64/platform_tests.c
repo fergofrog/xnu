@@ -56,6 +56,7 @@
 
 #define LOCK_PRIVATE 1
 
+#include <vm/pmap.h>
 #include <kern/kalloc.h>
 #include <kern/locks.h>
 #include <kern/misc_protos.h>
@@ -78,6 +79,7 @@
 #include <sys/munge.h>
 #include <machine/cpu_capabilities.h>
 #include <arm/cpu_data_internal.h>
+#include <arm/pmap.h>
 
 kern_return_t arm64_lock_test(void);
 kern_return_t arm64_munger_test(void);
@@ -425,6 +427,7 @@ static kern_return_t
 lt_test_trylocks()
 {
 	boolean_t success; 
+	extern unsigned int real_ncpus;
 	
 	/* 
 	 * First mtx try lock succeeds, second fails.
@@ -512,9 +515,15 @@ lt_test_trylocks()
 	lt_start_trylock_thread(lt_trylock_hw_lock_with_to);
 	success = hw_lock_to(&lt_hw_lock, 100);
 	T_ASSERT_NOTNULL(success, "First spin lock with timeout should succeed");
+	if (real_ncpus == 1) {
+		mp_enable_preemption(); /* if we re-enable preemption, the other thread can timeout and exit */
+	}
 	OSIncrementAtomic((volatile SInt32*)&lt_thread_lock_grabbed);
 	lt_wait_for_lock_test_threads();
 	T_ASSERT_NULL(lt_thread_lock_success, "Second spin lock with timeout should fail and timeout");
+	if (real_ncpus == 1) {
+		mp_disable_preemption(); /* don't double-enable when we unlock */
+	}
 	hw_lock_unlock(&lt_hw_lock);
 
 	lt_reset();
@@ -524,9 +533,15 @@ lt_test_trylocks()
 	OSMemoryBarrier();
 	lt_start_trylock_thread(lt_trylock_hw_lock_with_to);
 	hw_lock_lock(&lt_hw_lock);
+	if (real_ncpus == 1) {
+		mp_enable_preemption(); /* if we re-enable preemption, the other thread can timeout and exit */
+	}
 	OSIncrementAtomic((volatile SInt32*)&lt_thread_lock_grabbed);
 	lt_wait_for_lock_test_threads();
 	T_ASSERT_NULL(lt_thread_lock_success, "after taking a spin lock, lock attempt with timeout should fail");
+	if (real_ncpus == 1) {
+		mp_disable_preemption(); /* don't double-enable when we unlock */
+	}
 	hw_lock_unlock(&lt_hw_lock);
 
 	success = lck_spin_try_lock(&lt_lck_spin_t);
@@ -541,9 +556,15 @@ lt_test_trylocks()
 	lt_target_done_threads = 1;
 	lt_start_trylock_thread(lt_trylock_spin_try_lock);
 	lck_spin_lock(&lt_lck_spin_t);
+	if (real_ncpus == 1) {
+		mp_enable_preemption(); /* if we re-enable preemption, the other thread can timeout and exit */
+	}
 	OSIncrementAtomic((volatile SInt32*)&lt_thread_lock_grabbed);
 	lt_wait_for_lock_test_threads();
 	T_ASSERT_NULL(lt_thread_lock_success, "spin trylock attempt of previously held lock should fail");
+	if (real_ncpus == 1) {
+		mp_disable_preemption(); /* don't double-enable when we unlock */
+	}
 	lck_spin_unlock(&lt_lck_spin_t);
 
 	return KERN_SUCCESS;
@@ -1036,6 +1057,7 @@ ex_cb_test()
 	return KERN_SUCCESS;
 }
 
+
 #if __ARM_PAN_AVAILABLE__
 kern_return_t
 arm64_pan_test()
@@ -1099,4 +1121,5 @@ arm64_munger_test()
 	mt_test_mungers();
 	return 0;
 }
+
 

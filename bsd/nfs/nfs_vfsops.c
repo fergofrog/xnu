@@ -2328,6 +2328,9 @@ nocomponents:
 		nfsmout_if(error);
 		nfsm_chain_op_check(error, &nmrep, NFS_OP_GETFH);
 		nfsm_chain_get_32(error, &nmrep, fh.fh_len);
+		if (fh.fh_len > sizeof(fh.fh_data))
+			error = EBADRPC;
+		nfsmout_if(error);
 		nfsm_chain_get_opaque(error, &nmrep, fh.fh_len, fh.fh_data);
 		nfsm_chain_op_check(error, &nmrep, NFS_OP_GETATTR);
 		if (!error) {
@@ -2811,8 +2814,9 @@ mountnfs(
 	xb_get_32(error, &xb, val); /* version */
 	xb_get_32(error, &xb, argslength); /* args length */
 	xb_get_32(error, &xb, val); /* XDR args version */
-	if (val != NFS_XDRARGS_VERSION_0)
+	if (val != NFS_XDRARGS_VERSION_0 || argslength < ((4 + NFS_MATTR_BITMAP_LEN + 1) * XDRWORD)) {
 		error = EINVAL;
+	}
 	len = NFS_MATTR_BITMAP_LEN;
 	xb_get_bitmap(error, &xb, mattrs, len); /* mount attribute bitmap */
 	attrslength = 0;
@@ -3030,8 +3034,7 @@ mountnfs(
 			error = ENOMEM;
 		xb_get_32(error, &xb, nmp->nm_fh->fh_len);
 		nfsmerr_if(error);
-		if (nmp->nm_fh->fh_len < 0 ||
-		    (size_t)nmp->nm_fh->fh_len > sizeof(nmp->nm_fh->fh_data))
+		if ((size_t)nmp->nm_fh->fh_len > sizeof(nmp->nm_fh->fh_data))
 			error = EINVAL;
 		else
 			error = xb_get_bytes(&xb, (char*)&nmp->nm_fh->fh_data[0], nmp->nm_fh->fh_len, 0);
@@ -4458,6 +4461,7 @@ nfs_mount_zombie(struct nfsmount *nmp, int nm_state_flags)
 	if ((nmp->nm_vers >= NFS_VER4) && nmp->nm_renew_timer) {
 		thread_call_cancel(nmp->nm_renew_timer);
 		thread_call_free(nmp->nm_renew_timer);
+		nmp->nm_renew_timer = NULL;
 	}
 
 	lck_mtx_unlock(&nmp->nm_lock);
@@ -4483,6 +4487,7 @@ nfs_mount_zombie(struct nfsmount *nmp, int nm_state_flags)
 		if (nmp->nm_longid->nci_id)
 			FREE(nmp->nm_longid->nci_id, M_TEMP);
 		FREE(nmp->nm_longid, M_TEMP);
+		nmp->nm_longid = NULL;
 		lck_mtx_unlock(nfs_global_mutex);
 	}
 
@@ -4519,6 +4524,8 @@ nfs_mount_zombie(struct nfsmount *nmp, int nm_state_flags)
 	/* Since we've drop the request mutex we can now safely unreference the request */
 	TAILQ_FOREACH_SAFE(req, &resendq, r_rchain, treq) {
 		TAILQ_REMOVE(&resendq, req, r_rchain);
+		/* Make sure we don't try and remove again in nfs_request_destroy */
+		req->r_rchain.tqe_next = NFSREQNOLIST;
 		nfs_request_rele(req);
 	}
 

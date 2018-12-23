@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2008-2016 Apple Inc. All rights reserved.
+ * Copyright (c) 2008-2018 Apple Inc. All rights reserved.
  *
  * @APPLE_OSREFERENCE_LICENSE_HEADER_START@
  *
@@ -2873,8 +2873,10 @@ ipsec_updatereplay(u_int32_t seq, struct secasvar *sav)
 	wsizeb = replay->wsize << 3;
 
 	/* sequence number of 0 is invalid */
-	if (seq == 0)
-		return 1;
+    if (seq == 0) {
+        lck_mtx_unlock(sadb_mutex);
+        return 1;
+    }
 
 	/* first time */
 	if (replay->count == 0) {
@@ -3274,14 +3276,31 @@ ipsec4_interface_output(struct ipsec_output_state *state, ifnet_t interface)
 	
 	LCK_MTX_ASSERT(sadb_mutex, LCK_MTX_ASSERT_NOTOWNED);
 	
-	if (!state)
+	if (state == NULL) {
 		panic("state == NULL in ipsec4_output");
-	if (!state->m)
+	}
+	if (state->m == NULL) {
 		panic("state->m == NULL in ipsec4_output");
-	if (!state->dst)
+	}
+	if (state->dst == NULL) {
 		panic("state->dst == NULL in ipsec4_output");
+	}
+
+	struct ip *ip = mtod(state->m, struct ip *);
+
+	struct sockaddr_in src = {};
+	src.sin_family = AF_INET;
+	src.sin_len = sizeof(src);
+	memcpy(&src.sin_addr, &ip->ip_src, sizeof(src.sin_addr));
+
+	struct sockaddr_in dst = {};
+	dst.sin_family = AF_INET;
+	dst.sin_len = sizeof(dst);
+	memcpy(&dst.sin_addr, &ip->ip_dst, sizeof(dst.sin_addr));
 	
-	sav = key_alloc_outbound_sav_for_interface(interface, AF_INET);
+	sav = key_alloc_outbound_sav_for_interface(interface, AF_INET,
+											   (struct sockaddr *)&src,
+											   (struct sockaddr *)&dst);
 	if (sav == NULL) {
 		goto bad;
 	}
@@ -3291,13 +3310,15 @@ ipsec4_interface_output(struct ipsec_output_state *state, ifnet_t interface)
 	}
 	
 	KERNEL_DEBUG(DBG_FNC_IPSEC_OUT | DBG_FUNC_END, 0,0,0,0,0);
-	if (sav)
+	if (sav) {
 		key_freesav(sav, KEY_SADB_UNLOCKED);
+	}
 	return 0;
 	
 bad:
-	if (sav)
+	if (sav) {
 		key_freesav(sav, KEY_SADB_UNLOCKED);
+	}
 	m_freem(state->m);
 	state->m = NULL;
 	KERNEL_DEBUG(DBG_FNC_IPSEC_OUT | DBG_FUNC_END, error,0,0,0,0);
@@ -3689,8 +3710,13 @@ ipsec6_output_tunnel_internal(struct ipsec_output_state *state, struct secasvar 
 			struct sockaddr_in* dst4;
 			struct route *ro4 = NULL;
 			struct route  ro4_copy;
-			struct ip_out_args ipoa = { IFSCOPE_NONE, { 0 }, IPOAF_SELECT_SRCIF, 0,
-			    SO_TC_UNSPEC, _NET_SERVICE_TYPE_UNSPEC };
+			struct ip_out_args ipoa;
+
+			bzero(&ipoa, sizeof(ipoa));
+			ipoa.ipoa_boundif = IFSCOPE_NONE;
+			ipoa.ipoa_flags = IPOAF_SELECT_SRCIF;
+			ipoa.ipoa_sotc = SO_TC_UNSPEC;
+			ipoa.ipoa_netsvctype = _NET_SERVICE_TYPE_UNSPEC;
 			
 			if (must_be_last)
 				*must_be_last = 1;
@@ -4053,16 +4079,34 @@ ipsec6_interface_output(struct ipsec_output_state *state, ifnet_t interface, u_c
 	
 	LCK_MTX_ASSERT(sadb_mutex, LCK_MTX_ASSERT_NOTOWNED);
 	
-	if (!state)
+	if (state == NULL) {
 		panic("state == NULL in ipsec6_output");
-	if (!state->m)
+	}
+	if (state->m == NULL) {
 		panic("state->m == NULL in ipsec6_output");
-	if (!nexthdrp)
+	}
+	if (nexthdrp == NULL) {
 		panic("nexthdrp == NULL in ipsec6_output");
-	if (!mprev)
+	}
+	if (mprev == NULL) {
 		panic("mprev == NULL in ipsec6_output");
-	
-	sav = key_alloc_outbound_sav_for_interface(interface, AF_INET6);
+	}
+
+	struct ip6_hdr *ip6 = mtod(state->m, struct ip6_hdr *);
+
+	struct sockaddr_in6 src = {};
+	src.sin6_family = AF_INET6;
+	src.sin6_len = sizeof(src);
+	memcpy(&src.sin6_addr, &ip6->ip6_src, sizeof(src.sin6_addr));
+
+	struct sockaddr_in6 dst = {};
+	dst.sin6_family = AF_INET6;
+	dst.sin6_len = sizeof(dst);
+	memcpy(&dst.sin6_addr, &ip6->ip6_dst, sizeof(dst.sin6_addr));
+
+	sav = key_alloc_outbound_sav_for_interface(interface, AF_INET6,
+											   (struct sockaddr *)&src,
+											   (struct sockaddr *)&dst);
 	if (sav == NULL) {
 		goto bad;
 	}
@@ -4078,13 +4122,15 @@ ipsec6_interface_output(struct ipsec_output_state *state, ifnet_t interface, u_c
 		}
 	}
 	
-	if (sav)
+	if (sav) {
 		key_freesav(sav, KEY_SADB_UNLOCKED);
+	}
 	return 0;
 	
 bad:
-	if (sav)
+	if (sav) {
 		key_freesav(sav, KEY_SADB_UNLOCKED);
+	}
 	m_freem(state->m);
 	state->m = NULL;
 	return error;
@@ -4680,11 +4726,15 @@ ipsec_send_natt_keepalive(
 	struct mbuf	       *m;
 	struct ip          *ip;
 	int                 error;
-	struct ip_out_args  ipoa =
-	    { IFSCOPE_NONE, { 0 }, IPOAF_SELECT_SRCIF, 0,
-	    SO_TC_UNSPEC, _NET_SERVICE_TYPE_UNSPEC };
+	struct ip_out_args  ipoa;
 	struct route        ro;
 	int keepalive_interval = natt_keepalive_interval;
+
+	bzero(&ipoa, sizeof(ipoa));
+	ipoa.ipoa_boundif = IFSCOPE_NONE;
+	ipoa.ipoa_flags = IPOAF_SELECT_SRCIF;
+	ipoa.ipoa_sotc = SO_TC_UNSPEC;
+	ipoa.ipoa_netsvctype = _NET_SERVICE_TYPE_UNSPEC;
 
 	LCK_MTX_ASSERT(sadb_mutex, LCK_MTX_ASSERT_NOTOWNED);
 

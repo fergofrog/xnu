@@ -436,6 +436,12 @@ void ml_init_timebase(
 }
 
 void
+fiq_context_bootstrap(boolean_t enable_fiq)
+{
+	fiq_context_init(enable_fiq);
+}
+
+void
 ml_parse_cpu_topology(void)
 {
 	DTEntry entry, child;
@@ -544,9 +550,6 @@ ml_processor_register(
 
 	this_cpu_datap->cpu_id = in_processor_info->cpu_id;
 
-	this_cpu_datap->cpu_chud = chudxnu_cpu_alloc(is_boot_cpu);
-	if (this_cpu_datap->cpu_chud == (void *)NULL)
-		goto processor_register_error;
 	this_cpu_datap->cpu_console_buf = console_cpu_alloc(is_boot_cpu);
 	if (this_cpu_datap->cpu_console_buf == (void *)(NULL))
 		goto processor_register_error;
@@ -596,7 +599,7 @@ ml_processor_register(
 #endif
 
 	if (!is_boot_cpu)
-		prng_cpu_init(this_cpu_datap->cpu_number);
+		early_random_cpu_init(this_cpu_datap->cpu_number);
 
 	return KERN_SUCCESS;
 
@@ -604,8 +607,6 @@ processor_register_error:
 #if KPC
 	kpc_unregister_cpu(this_cpu_datap);
 #endif
-	if (this_cpu_datap->cpu_chud != (void *)NULL)
-		chudxnu_cpu_free(this_cpu_datap->cpu_chud);
 	if (!is_boot_cpu)
 		cpu_data_free(this_cpu_datap);
 	return KERN_FAILURE;
@@ -642,23 +643,6 @@ cause_ast_check(
 		cpu_signal(processor_to_cpu_datap(processor), SIGPast, (void *)NULL, (void *)NULL);
 		KERNEL_DEBUG_CONSTANT(MACHDBG_CODE(DBG_MACH_SCHED, MACH_REMOTE_AST), processor->cpu_id, 1 /* ast */, 0, 0, 0);
 	}
-}
-
-
-/*
- *	Routine:        ml_at_interrupt_context
- *	Function:	Check if running at interrupt context
- */
-boolean_t 
-ml_at_interrupt_context(void)
-{
-	boolean_t at_interrupt_context = FALSE;
-
-	disable_preemption();
-	at_interrupt_context = (getCpuDatap()->cpu_int_state != NULL);
-	enable_preemption();
-
-	return at_interrupt_context;
 }
 
 extern uint32_t cpu_idle_count;
@@ -727,6 +711,19 @@ ml_static_vtop(
 	return ((vm_address_t)(vaddr) - gVirtBase + gPhysBase);
 }
 
+vm_offset_t
+ml_static_slide(
+	vm_offset_t vaddr)
+{
+	return VM_KERNEL_SLIDE(vaddr);
+}
+
+vm_offset_t
+ml_static_unslide(
+	vm_offset_t vaddr)
+{
+	return VM_KERNEL_UNSLIDE(vaddr);
+}
 
 kern_return_t
 ml_static_protect(
@@ -968,20 +965,6 @@ machine_choose_processor(__unused processor_set_t pset, processor_t processor)
 	return (processor);
 }
 
-vm_offset_t 
-ml_stack_remaining(void)
-{
-	uintptr_t local = (uintptr_t) &local;
-	vm_offset_t     intstack_top_ptr;
-
-	intstack_top_ptr = getCpuDatap()->intstack_top;
-	if ((local < intstack_top_ptr) && (local > intstack_top_ptr - INTSTACK_SIZE)) {
-	    return (local - (getCpuDatap()->intstack_top - INTSTACK_SIZE));
-	} else {
-	    return (local - current_thread()->kernel_stack);
-	}
-}
-
 boolean_t machine_timeout_suspended(void) {
 	return FALSE;
 }
@@ -1028,7 +1011,7 @@ ml_delay_should_spin(uint64_t interval)
 
 boolean_t ml_thread_is64bit(thread_t thread)
 {
-	return (thread_is_64bit(thread));
+	return (thread_is_64bit_addr(thread));
 }
 
 void ml_timer_evaluate(void) {
@@ -1156,8 +1139,3 @@ arm_user_protect_end(thread_t thread, uintptr_t ttbr0, boolean_t disable_interru
     }
 }
 #endif // __ARM_USER_PROTECT__
-
-void ml_task_set_rop_pid(__unused task_t task, __unused task_t parent_task, __unused boolean_t inherit)
-{
-	return;
-}
