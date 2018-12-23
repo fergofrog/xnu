@@ -740,3 +740,7 @@ options		COPYOUT_SHIM			# Shim for copyout memory analysis via kext #<copyout_sh
 # Telemetry for 32-bit process launch
 #
 options		CONFIG_32BIT_TELEMETRY # # <config_32bit_telemetry>
+
+#
+# Embedded hardware operation
+options     CONFIG_EMBEDDED        # embedded hardware # <config_embedded>
